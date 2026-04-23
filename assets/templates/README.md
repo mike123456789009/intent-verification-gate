@@ -1,0 +1,15 @@
+# Intent Verification
+
+This directory stores durable intent-verification runs for meaningful changes.
+
+Use the reusable helper from Codex home:
+
+```bash
+export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+export IVG="$CODEX_HOME/skills/intent-verification-gate/scripts/intent_run.py"
+python3 "$IVG" diagnose --repo .
+python3 "$IVG" init --repo . --slug short-task-name --json
+python3 "$IVG" validate --run-dir /absolute/path/to/run --json
+```
+
+The gate uses phased review packets so reviewers first extract intent from the raw request before seeing the main agent's intent statement.

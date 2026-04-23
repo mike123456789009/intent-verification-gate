@@ -1,0 +1,171 @@
+---
+name: "intent-verification-gate"
+description: "Enforce durable, bias-resistant intent verification for meaningful product, UX, UI, behavioral, navigation, architecture, information-hierarchy, interaction, or workflow changes. Use when Codex should save the user's verbatim request, a Best Estimate Statement of User Intent, a change manifest, evidence, phased reviewer outputs, and machine-readable gate status before returning success."
+---
+
+# Intent Verification Gate
+
+Create a durable artifact trail for meaningful changes and use it as a completion gate.
+
+## Apply the trigger test
+
+Use this skill when the change is non-trivial and affects any of:
+
+- UI or layout
+- UX or workflow
+- product behavior
+- navigation
+- architecture or page responsibility
+- information hierarchy
+- interaction logic
+- copy that changes meaning
+- state or control patterns
+- visible feature additions or removals
+- global or durable Codex behavior
+- high-blast-radius project workflow
+
+Skip this skill for tiny typo fixes, formatting-only edits, dependency bumps with no user-facing effect, and pure refactors with no behavioral effect.
+
+Use the repo's local gate config when present. If the repo or user defines a stricter gate, follow that stricter rule. Use this skill as the reusable default.
+
+## Diagnose the target repo
+
+Set the helper path once:
+
+```bash
+export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+export IVG="$CODEX_HOME/skills/intent-verification-gate/scripts/intent_run.py"
+```
+
+Before using the gate in a new or unfamiliar repo, inspect the local configuration:
+
+```bash
+python3 "$IVG" diagnose --repo . --json
+```
+
+Use `install` only when a project needs the artifact root, config, README, or local `AGENTS.md` routing block created:
+
+```bash
+python3 "$IVG" install --repo /path/to/project --json
+```
+
+## Create the run folder before substantive work
+
+Create the run folder before substantive implementation:
+
+```bash
+python3 "$IVG" init --slug short-task-name --json
+```
+
+Use `--repo /path/to/repo` when you are not already inside the target repo.
+Use `--artifacts-root relative/path` if the repo defines a different artifact root. Otherwise the helper uses repo config or `docs/intent-verification`.
+
+Immediately write these files:
+
+- `request.md`: the user's verbatim request
+- `intent.md`: the Best Estimate Statement of User Intent
+- `trigger-decision.md`: the short reason the gate was used, or why a borderline case was skipped
+
+Do not begin substantive implementation until `request.md` and `intent.md` exist with real content.
+
+## Follow the artifact workflow
+
+1. Save the verbatim user request in `request.md` without paraphrase.
+2. Save the Best Estimate Statement of User Intent in `intent.md`.
+3. Save the trigger decision in `trigger-decision.md`.
+4. Perform the implementation.
+5. Save a descriptive `change-manifest.md` and `evidence.md` before review.
+6. Create the next review file when review is ready:
+
+```bash
+python3 "$IVG" next-review --run-dir /abs/path/to/run --json
+```
+
+7. Generate clean phased reviewer packets:
+
+```bash
+python3 "$IVG" review-packet --phase blind-intent --run-dir /abs/path/to/run
+python3 "$IVG" review-packet --phase intent-comparison --run-dir /abs/path/to/run
+python3 "$IVG" review-packet --phase implementation --run-dir /abs/path/to/run
+```
+
+8. Save the reviewer output into the newly allocated `review-0N.md`.
+9. Run validation before returning success:
+
+```bash
+python3 "$IVG" validate --run-dir /abs/path/to/run --json
+```
+
+10. If the work is blocked and cannot honestly exceed the threshold, create the blocker file:
+
+```bash
+python3 "$IVG" blocker --run-dir /abs/path/to/run --json
+```
+
+11. Save the blocker report in `blocker-report.md` and run validation again so status is recorded as blocked.
+
+## Enforce phased reviewer independence
+
+Use a fresh reviewer context when possible.
+
+The review must happen in this order:
+
+1. `blind-intent`: give the reviewer only `request.md`. The reviewer writes an independent intent statement before seeing the main agent's intent.
+2. `intent-comparison`: give the reviewer `request.md`, the reviewer independent intent, and `intent.md`. The reviewer flags omitted requests, invented constraints, softened wording, and ambiguity handling.
+3. `implementation`: give the reviewer the corrected intent, `change-manifest.md`, and `evidence.md`. The reviewer grades the implementation against corrected intent, not merely against the main agent's intent.
+
+Do not give the reviewer:
+
+- the main agent's justification
+- the main agent's plan
+- persuasion about why the work is good
+- instructions to be lenient
+- target score suggestions
+
+If subagents are unavailable and independent review is mandatory, treat that as a blocker and save `blocker-report.md`.
+
+## Enforce the pass/fail gate
+
+For strict and standard modes, do not return success unless all of these are true:
+
+- Intent Extraction >= 90
+- Intent Comparison >= 90
+- Alignment >= 90
+- Completeness >= 90
+- Scope Discipline >= 90
+- Constraint Obedience >= 90
+- no explicit request is marked `Missed`
+- no core constraint is violated
+- no rejected pattern is reintroduced in equivalent form
+- `validate --run-dir` exits successfully
+- `gate-status.json` records `passed`
+
+If any score is below threshold, revise the work and allocate a fresh `review-0N.md` file for the next round.
+
+Lightweight mode is for early trials or low-risk work only. It still requires durable request, intent, manifest, and evidence artifacts, but project config may relax review requirements.
+
+## Keep run history browseable
+
+After significant gate work or before handoff, update the run index:
+
+```bash
+python3 "$IVG" index --repo . --json
+```
+
+The helper writes `index.md` and `index.json` under the configured artifact root.
+
+## Use the exact formats
+
+Read [references/gate-spec.md](./references/gate-spec.md) when you need:
+
+- the exact Best Estimate Statement format
+- the exact Trigger Decision format
+- the exact Change Manifest format
+- the exact Evidence format
+- the exact REVIEW format
+- the scoring rubric
+- blocker wording
+- status file fields
+- final-return requirements
+
+The helper script copies template files from `assets/templates/`. Fill them in; do not invent alternate headings unless the repo or user explicitly overrides the format.

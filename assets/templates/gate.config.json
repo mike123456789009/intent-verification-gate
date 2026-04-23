@@ -1,0 +1,10 @@
+{
+  "artifactsRoot": "docs/intent-verification",
+  "mode": "strict",
+  "profile": "auto",
+  "requiredChecks": [],
+  "visualQa": false,
+  "deployVerification": false,
+  "reviewMode": "blind-intent",
+  "staleReviewDetection": true
+}

@@ -1,0 +1,1184 @@
+#!/usr/bin/env python3
+"""
+Create, validate, and manage durable intent-verification artifact folders.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_ARTIFACTS_ROOT = "docs/intent-verification"
+CONFIG_FILENAME = "gate.config.json"
+STATUS_FILENAME = "gate-status.json"
+TRIGGER_DECISION_FILENAME = "trigger-decision.md"
+INDEX_JSON_FILENAME = "index.json"
+INDEX_MD_FILENAME = "index.md"
+RUNS_DIRNAME = "runs"
+REVIEW_RE = re.compile(r"^review-(\d{2})\.md$")
+SCORE_FIELDS = (
+    "Intent Extraction",
+    "Intent Comparison",
+    "Alignment",
+    "Completeness",
+    "Scope Discipline",
+    "Constraint Obedience",
+)
+OPTIONAL_SCORE_FIELDS = ("Main intent accuracy",)
+VALID_PHASES = ("blind-intent", "intent-comparison", "implementation")
+
+
+PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "web-app": {
+        "requiredChecks": ["lint", "typecheck", "test", "build"],
+        "visualQa": True,
+        "deployVerification": False,
+    },
+    "cli": {
+        "requiredChecks": ["test"],
+        "visualQa": False,
+        "deployVerification": False,
+    },
+    "docs-only": {
+        "requiredChecks": [],
+        "visualQa": False,
+        "deployVerification": False,
+    },
+    "macos-app": {
+        "requiredChecks": ["build", "test"],
+        "visualQa": True,
+        "deployVerification": False,
+    },
+    "ios-app": {
+        "requiredChecks": ["build", "test"],
+        "visualQa": True,
+        "deployVerification": False,
+    },
+    "backend": {
+        "requiredChecks": ["lint", "typecheck", "test"],
+        "visualQa": False,
+        "deployVerification": False,
+    },
+    "monorepo": {
+        "requiredChecks": ["lint", "typecheck", "test", "build"],
+        "visualQa": True,
+        "deployVerification": False,
+    },
+    "global-codex-config": {
+        "requiredChecks": ["py_compile", "test"],
+        "visualQa": False,
+        "deployVerification": False,
+    },
+    "small-script": {
+        "requiredChecks": ["test"],
+        "visualQa": False,
+        "deployVerification": False,
+    },
+}
+
+
+@dataclass
+class GateConfig:
+    repo_root: Path
+    artifacts_root_rel: str
+    artifacts_root: Path
+    mode: str
+    profile: str
+    detected_profile: str
+    required_checks: list[str] = field(default_factory=list)
+    visual_qa: bool = False
+    deploy_verification: bool = False
+    review_mode: str = "blind-intent"
+    stale_review_detection: bool = True
+    config_path: Path | None = None
+    config_found: bool = False
+    package_manager: str | None = None
+    framework: str | None = None
+    likely_checks: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RunPaths:
+    repo_root: Path
+    artifacts_root: Path
+    run_dir: Path
+    request_path: Path
+    intent_path: Path
+    manifest_path: Path
+    evidence_path: Path
+    trigger_decision_path: Path
+    status_path: Path
+
+
+@dataclass
+class ValidationResult:
+    status: str
+    ok: bool
+    issues: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    scores: dict[str, int] = field(default_factory=dict)
+    latest_review: str | None = None
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso_now() -> str:
+    return utc_now().isoformat().replace("+00:00", "Z")
+
+
+def skill_dir() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def templates_dir() -> Path:
+    return skill_dir() / "assets" / "templates"
+
+
+def slugify(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", value.strip().lower())
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+    return normalized or "task"
+
+
+def run_git_root(path: Path) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    return Path(result.stdout.strip()).resolve()
+
+
+def detect_repo_root(explicit_repo: str | None) -> Path:
+    if explicit_repo:
+        explicit = Path(explicit_repo).expanduser().resolve()
+        git_root = run_git_root(explicit)
+        return git_root or explicit
+
+    cwd = Path.cwd().resolve()
+    git_root = run_git_root(cwd)
+    return git_root or cwd
+
+
+def parse_timestamp(raw_timestamp: str | None) -> datetime:
+    if not raw_timestamp:
+        return utc_now()
+
+    cleaned = raw_timestamp.strip()
+    for fmt in ("%Y%m%dT%H%M%SZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            parsed = datetime.strptime(cleaned, fmt)
+            return parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+    raise SystemExit(
+        "Invalid --timestamp. Use YYYYMMDDTHHMMSSZ or YYYY-MM-DDTHH:MM:SSZ."
+    )
+
+
+def stamp_parts(timestamp: datetime) -> tuple[str, str]:
+    stamp = timestamp.strftime("%Y%m%dT%H%M%SZ")
+    date_part = timestamp.strftime("%Y-%m-%d")
+    return stamp, date_part
+
+
+def read_template(name: str) -> str:
+    template_path = templates_dir() / name
+    if not template_path.exists():
+        raise SystemExit(f"Missing template: {template_path}")
+    return template_path.read_text()
+
+
+def ensure_file(path: Path, template_name: str) -> bool:
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(read_template(template_name))
+    return True
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON in {path}: {exc}") from exc
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def detect_package_manager(repo_root: Path) -> str | None:
+    markers = (
+        ("pnpm-lock.yaml", "pnpm"),
+        ("yarn.lock", "yarn"),
+        ("package-lock.json", "npm"),
+        ("bun.lockb", "bun"),
+        ("uv.lock", "uv"),
+        ("poetry.lock", "poetry"),
+        ("Cargo.lock", "cargo"),
+        ("Package.resolved", "swiftpm"),
+    )
+    for filename, manager in markers:
+        if (repo_root / filename).exists():
+            return manager
+    if (repo_root / "package.json").exists():
+        return "npm"
+    if (repo_root / "pyproject.toml").exists():
+        return "python"
+    if (repo_root / "Package.swift").exists():
+        return "swiftpm"
+    if (repo_root / "Cargo.toml").exists():
+        return "cargo"
+    return None
+
+
+def read_package_json(repo_root: Path) -> dict[str, Any]:
+    package_path = repo_root / "package.json"
+    if not package_path.exists():
+        return {}
+    return read_json(package_path)
+
+
+def detect_framework(repo_root: Path) -> str | None:
+    package = read_package_json(repo_root)
+    deps: dict[str, Any] = {}
+    for key in ("dependencies", "devDependencies", "peerDependencies"):
+        value = package.get(key)
+        if isinstance(value, dict):
+            deps.update(value)
+
+    if any((repo_root / name).exists() for name in ("next.config.js", "next.config.mjs", "next.config.ts")):
+        return "nextjs"
+    if any((repo_root / name).exists() for name in ("vite.config.js", "vite.config.mjs", "vite.config.ts")):
+        return "vite"
+    if "next" in deps:
+        return "nextjs"
+    if "vite" in deps:
+        return "vite"
+    if "react" in deps:
+        return "react"
+    if (repo_root / "pyproject.toml").exists():
+        return "python"
+    if (repo_root / "Cargo.toml").exists():
+        return "rust"
+    if (repo_root / "Package.swift").exists():
+        return "swift"
+    if list(repo_root.glob("*.xcodeproj")):
+        return "xcode"
+    return None
+
+
+def package_scripts(repo_root: Path) -> dict[str, str]:
+    package = read_package_json(repo_root)
+    scripts = package.get("scripts")
+    return scripts if isinstance(scripts, dict) else {}
+
+
+def detect_likely_checks(repo_root: Path, profile: str) -> list[str]:
+    scripts = package_scripts(repo_root)
+    checks: list[str] = []
+    for name in ("lint", "typecheck", "test", "build"):
+        if name in scripts:
+            checks.append(name)
+    if checks:
+        return checks
+
+    if (repo_root / "pyproject.toml").exists():
+        return ["test"]
+    if (repo_root / "Package.swift").exists() or list(repo_root.glob("*.xcodeproj")):
+        return ["build", "test"]
+    return list(PROFILE_DEFAULTS.get(profile, PROFILE_DEFAULTS["small-script"])["requiredChecks"])
+
+
+def infer_profile(repo_root: Path, package_manager: str | None, framework: str | None) -> str:
+    package = read_package_json(repo_root)
+    if package.get("workspaces") or (repo_root / "pnpm-workspace.yaml").exists():
+        return "monorepo"
+    if repo_root == (Path.home() / ".codex").resolve() or ".codex" in repo_root.parts:
+        return "global-codex-config"
+    if framework in {"nextjs", "vite", "react"}:
+        return "web-app"
+    if framework == "xcode":
+        return "macos-app"
+    if framework == "swift":
+        return "macos-app"
+    if framework in {"python", "rust"}:
+        return "backend"
+    if package_manager in {"npm", "pnpm", "yarn", "bun"}:
+        return "cli"
+    if (repo_root / "docs").exists() and not any(
+        (repo_root / name).exists()
+        for name in ("package.json", "pyproject.toml", "Cargo.toml", "Package.swift")
+    ):
+        return "docs-only"
+    return "small-script"
+
+
+def candidate_config_paths(repo_root: Path, artifacts_root_rel: str | None = None) -> list[Path]:
+    paths: list[Path] = []
+    if artifacts_root_rel:
+        paths.append(repo_root / artifacts_root_rel / CONFIG_FILENAME)
+    paths.append(repo_root / DEFAULT_ARTIFACTS_ROOT / CONFIG_FILENAME)
+    paths.append(repo_root / ".intent-verification-gate.json")
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        resolved = path.resolve()
+        if resolved not in seen:
+            deduped.append(path)
+            seen.add(resolved)
+    return deduped
+
+
+def load_gate_config(repo_root: Path, artifacts_root_rel: str | None = None) -> GateConfig:
+    config_path = next((path for path in candidate_config_paths(repo_root, artifacts_root_rel) if path.exists()), None)
+    raw = read_json(config_path) if config_path else {}
+
+    package_manager = detect_package_manager(repo_root)
+    framework = detect_framework(repo_root)
+    detected_profile = infer_profile(repo_root, package_manager, framework)
+    profile = str(raw.get("profile") or "auto")
+    if profile == "auto":
+        profile = detected_profile
+    if profile not in PROFILE_DEFAULTS:
+        profile = "small-script"
+    defaults = PROFILE_DEFAULTS[profile]
+
+    artifacts_rel = str(
+        artifacts_root_rel
+        or raw.get("artifactsRoot")
+        or DEFAULT_ARTIFACTS_ROOT
+    )
+    likely_checks = detect_likely_checks(repo_root, profile)
+    required_checks = raw.get("requiredChecks", defaults.get("requiredChecks", []))
+    if not isinstance(required_checks, list):
+        required_checks = []
+
+    return GateConfig(
+        repo_root=repo_root,
+        artifacts_root_rel=artifacts_rel,
+        artifacts_root=(repo_root / artifacts_rel).resolve(),
+        mode=str(raw.get("mode") or "strict"),
+        profile=profile,
+        detected_profile=detected_profile,
+        required_checks=[str(item) for item in required_checks],
+        visual_qa=bool(raw.get("visualQa", defaults.get("visualQa", False))),
+        deploy_verification=bool(raw.get("deployVerification", defaults.get("deployVerification", False))),
+        review_mode=str(raw.get("reviewMode") or "blind-intent"),
+        stale_review_detection=bool(raw.get("staleReviewDetection", True)),
+        config_path=config_path.resolve() if config_path else None,
+        config_found=config_path is not None,
+        package_manager=package_manager,
+        framework=framework,
+        likely_checks=likely_checks,
+    )
+
+
+def config_payload(config: GateConfig) -> dict[str, Any]:
+    return {
+        "artifactsRoot": config.artifacts_root_rel,
+        "mode": config.mode,
+        "profile": config.profile,
+        "detectedProfile": config.detected_profile,
+        "requiredChecks": config.required_checks,
+        "visualQa": config.visual_qa,
+        "deployVerification": config.deploy_verification,
+        "reviewMode": config.review_mode,
+        "staleReviewDetection": config.stale_review_detection,
+        "configFound": config.config_found,
+        "configPath": str(config.config_path) if config.config_path else None,
+        "packageManager": config.package_manager,
+        "framework": config.framework,
+        "likelyChecks": config.likely_checks,
+    }
+
+
+def status_path(run_dir: Path) -> Path:
+    return run_dir / STATUS_FILENAME
+
+
+def read_status(run_dir: Path) -> dict[str, Any]:
+    return read_json(status_path(run_dir))
+
+
+def update_status(run_dir: Path, status: str, **fields: Any) -> dict[str, Any]:
+    payload = read_status(run_dir)
+    if not payload:
+        payload = {"schemaVersion": 1, "events": []}
+    payload.update(fields)
+    payload["status"] = status
+    payload["updatedAt"] = iso_now()
+    events = payload.setdefault("events", [])
+    if isinstance(events, list):
+        events.append({"at": payload["updatedAt"], "status": status})
+    write_json(status_path(run_dir), payload)
+    return payload
+
+
+def init_run(config: GateConfig, slug: str, timestamp: datetime) -> RunPaths:
+    stamp, date_part = stamp_parts(timestamp)
+    normalized_slug = slugify(slug)
+    run_dir = config.artifacts_root / RUNS_DIRNAME / date_part / f"{stamp}-{normalized_slug}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    request_path = run_dir / "request.md"
+    intent_path = run_dir / "intent.md"
+    manifest_path = run_dir / "change-manifest.md"
+    evidence_path = run_dir / "evidence.md"
+    trigger_decision_path = run_dir / TRIGGER_DECISION_FILENAME
+    run_status_path = run_dir / STATUS_FILENAME
+
+    ensure_file(request_path, "request.md")
+    ensure_file(intent_path, "intent.md")
+    ensure_file(manifest_path, "change-manifest.md")
+    ensure_file(evidence_path, "evidence.md")
+    ensure_file(trigger_decision_path, "trigger-decision.md")
+
+    write_json(
+        run_status_path,
+        {
+            "schemaVersion": 1,
+            "status": "initialized",
+            "createdAt": iso_now(),
+            "updatedAt": iso_now(),
+            "repoRoot": str(config.repo_root),
+            "artifactsRoot": str(config.artifacts_root),
+            "runDir": str(run_dir),
+            "mode": config.mode,
+            "profile": config.profile,
+            "reviewMode": config.review_mode,
+            "requiredChecks": config.required_checks,
+            "visualQa": config.visual_qa,
+            "deployVerification": config.deploy_verification,
+            "staleReviewDetection": config.stale_review_detection,
+            "events": [{"at": iso_now(), "status": "initialized"}],
+        },
+    )
+
+    return RunPaths(
+        repo_root=config.repo_root,
+        artifacts_root=config.artifacts_root,
+        run_dir=run_dir,
+        request_path=request_path,
+        intent_path=intent_path,
+        manifest_path=manifest_path,
+        evidence_path=evidence_path,
+        trigger_decision_path=trigger_decision_path,
+        status_path=run_status_path,
+    )
+
+
+def next_review_number(run_dir: Path) -> int:
+    highest = 0
+    for child in run_dir.iterdir():
+        match = REVIEW_RE.match(child.name)
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return highest + 1
+
+
+def create_next_review(run_dir: Path) -> Path:
+    run_dir = run_dir.resolve()
+    if not run_dir.is_dir():
+        raise SystemExit(f"Run directory not found: {run_dir}")
+    review_number = next_review_number(run_dir)
+    review_path = run_dir / f"review-{review_number:02d}.md"
+    ensure_file(review_path, "review.md")
+    update_status(
+        run_dir,
+        "reviewing",
+        latestReview=str(review_path),
+        latestReviewCreatedAt=iso_now(),
+    )
+    return review_path
+
+
+def create_blocker(run_dir: Path) -> Path:
+    run_dir = run_dir.resolve()
+    if not run_dir.is_dir():
+        raise SystemExit(f"Run directory not found: {run_dir}")
+    blocker_path = run_dir / "blocker-report.md"
+    ensure_file(blocker_path, "blocker-report.md")
+    update_status(run_dir, "blocked", blockerPath=str(blocker_path))
+    return blocker_path
+
+
+def latest_review_path(run_dir: Path) -> Path | None:
+    reviews = sorted(
+        (child for child in run_dir.iterdir() if REVIEW_RE.match(child.name)),
+        key=lambda path: int(REVIEW_RE.match(path.name).group(1)),  # type: ignore[union-attr]
+    )
+    return reviews[-1] if reviews else None
+
+
+def extract_section(text: str, start: str, end: str | None = None) -> str:
+    start_index = text.find(start)
+    if start_index == -1:
+        return ""
+    start_index += len(start)
+    if end:
+        end_index = text.find(end, start_index)
+        if end_index != -1:
+            return text[start_index:end_index].strip()
+    return text[start_index:].strip()
+
+
+def file_block(label: str, path: Path) -> str:
+    content = path.read_text() if path.exists() else f"[missing: {path.name}]"
+    return f"## {label}\n\n```text\n{content.rstrip()}\n```\n"
+
+
+def build_review_packet(run_dir: Path, phase: str, review_file: Path | None = None) -> str:
+    run_dir = run_dir.resolve()
+    if phase not in VALID_PHASES:
+        raise SystemExit(f"Invalid phase: {phase}. Use one of: {', '.join(VALID_PHASES)}")
+
+    request_path = run_dir / "request.md"
+    intent_path = run_dir / "intent.md"
+    manifest_path = run_dir / "change-manifest.md"
+    evidence_path = run_dir / "evidence.md"
+    review_path = review_file or latest_review_path(run_dir)
+    review_text = review_path.read_text() if review_path and review_path.exists() else ""
+    blind_intent = extract_section(review_text, "Phase 1 - Blind Intent", "Phase 2 - Intent Comparison")
+    corrected_intent = extract_section(
+        review_text,
+        "Corrected intent for implementation review:",
+        "Phase 3 - Implementation Review",
+    )
+
+    if phase == "blind-intent":
+        return "\n".join(
+            [
+                "# Review Packet: Blind Intent",
+                "",
+                "You are the independent reviewer. Use only the verbatim user request below.",
+                "Write the Phase 1 blind intent section before seeing the main agent's intent.",
+                "",
+                file_block("Verbatim User Request", request_path),
+            ]
+        )
+
+    if phase == "intent-comparison":
+        return "\n".join(
+            [
+                "# Review Packet: Intent Comparison",
+                "",
+                "Compare the reviewer independent intent against the main agent's Best Estimate Statement.",
+                "Flag omitted requests, invented constraints, softened wording, and ambiguity handling issues.",
+                "",
+                file_block("Verbatim User Request", request_path),
+                "## Reviewer Independent Intent From Phase 1",
+                "",
+                "```text",
+                blind_intent or "[missing Phase 1 blind intent in review file]",
+                "```",
+                "",
+                file_block("Main Agent Intent", intent_path),
+            ]
+        )
+
+    return "\n".join(
+        [
+            "# Review Packet: Implementation Review",
+            "",
+            "Grade implementation against corrected intent, not merely against the main agent's intent statement.",
+            "",
+            "## Corrected Intent",
+            "",
+            "```text",
+            corrected_intent or "[missing corrected intent in review file]",
+            "```",
+            "",
+            file_block("Change Manifest", manifest_path),
+            file_block("Evidence", evidence_path),
+        ]
+    )
+
+
+def file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+PLACEHOLDER_PATTERNS = (
+    re.compile(r"(^|\n)\s*(?:[-*]\s*)?\d*\.\s*\.\.\.\s*(\n|$)"),
+    re.compile(r"\.\.\."),
+    re.compile(r"__/100"),
+    re.compile(r"Paste the user's request"),
+    re.compile(r"Used / Skipped"),
+    re.compile(r"strict / standard / lightweight"),
+    re.compile(r"low / medium / high"),
+    re.compile(r"Met / Partially Met / Missed"),
+    re.compile(r"Yes/No"),
+    re.compile(r"Pass / Fail"),
+)
+
+
+def file_has_placeholders(path: Path) -> bool:
+    text = path.read_text()
+    if len(text.strip()) < 20:
+        return True
+    return any(pattern.search(text) for pattern in PLACEHOLDER_PATTERNS)
+
+
+def parse_scores(text: str) -> dict[str, int]:
+    scores: dict[str, int] = {}
+    fields = "|".join(re.escape(field) for field in SCORE_FIELDS + OPTIONAL_SCORE_FIELDS)
+    pattern = re.compile(rf"^({fields}):\s*(\d{{1,3}})/100\s*$", re.MULTILINE)
+    for match in pattern.finditer(text):
+        scores[match.group(1)] = int(match.group(2))
+    return scores
+
+
+def detect_repo_from_run(run_dir: Path) -> Path:
+    status = read_status(run_dir)
+    repo_root = status.get("repoRoot")
+    if isinstance(repo_root, str) and repo_root:
+        return Path(repo_root).resolve()
+
+    git_root = run_git_root(run_dir)
+    if git_root:
+        return git_root
+
+    artifact_root = run_dir.parents[2] if len(run_dir.parents) >= 3 else run_dir.parent
+    if artifact_root.name == "intent-verification" and artifact_root.parent.name == "docs":
+        return artifact_root.parent.parent.resolve()
+    return artifact_root.parent.resolve()
+
+
+PATH_TOKEN_RE = re.compile(r"`([^`]+)`|(?:^|\s)((?:/[^:\s]+|[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+))")
+
+
+def referenced_paths(repo_root: Path, run_dir: Path) -> list[Path]:
+    paths: list[Path] = []
+    for artifact_name in ("change-manifest.md", "evidence.md"):
+        artifact = run_dir / artifact_name
+        if not artifact.exists():
+            continue
+        text = artifact.read_text()
+        for match in PATH_TOKEN_RE.finditer(text):
+            raw = (match.group(1) or match.group(2) or "").strip()
+            if not raw or raw.startswith("http"):
+                continue
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                candidate = repo_root / candidate
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved.is_file() and run_dir not in resolved.parents and resolved != run_dir:
+                paths.append(resolved)
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        if path not in seen:
+            deduped.append(path)
+            seen.add(path)
+    return deduped
+
+
+def validate_blocker(run_dir: Path) -> ValidationResult:
+    blocker_path = run_dir / "blocker-report.md"
+    issues: list[str] = []
+    if not blocker_path.exists():
+        return ValidationResult(status="failed", ok=False, issues=["blocker-report.md is missing"])
+    if file_has_placeholders(blocker_path):
+        issues.append("blocker-report.md still contains placeholders or incomplete fields")
+    text = blocker_path.read_text()
+    required = (
+        "Blocked requirement:",
+        "Why this prevents a passing result:",
+        "What exact external input is needed:",
+        "Smallest human action needed:",
+        "Interim status:",
+    )
+    for heading in required:
+        if heading not in text:
+            issues.append(f"blocker-report.md is missing heading: {heading}")
+    return ValidationResult(status="blocked", ok=not issues, issues=issues)
+
+
+def validation_threshold(config: GateConfig) -> int:
+    return 75 if config.mode == "lightweight" else 90
+
+
+def validate_run(run_dir: Path, config: GateConfig | None = None) -> ValidationResult:
+    run_dir = run_dir.resolve()
+    if not run_dir.is_dir():
+        return ValidationResult(status="failed", ok=False, issues=[f"Run directory not found: {run_dir}"])
+
+    repo_root = detect_repo_from_run(run_dir)
+    config = config or load_gate_config(repo_root)
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    required_files = (
+        "request.md",
+        "intent.md",
+        TRIGGER_DECISION_FILENAME,
+        "change-manifest.md",
+        "evidence.md",
+    )
+    for filename in required_files:
+        path = run_dir / filename
+        if not path.exists():
+            issues.append(f"{filename} is missing")
+            continue
+        if file_has_placeholders(path):
+            issues.append(f"{filename} still contains placeholders or incomplete fields")
+
+    blocker_path = run_dir / "blocker-report.md"
+    if blocker_path.exists():
+        blocker_result = validate_blocker(run_dir)
+        if blocker_result.ok:
+            update_status(run_dir, "blocked", issues=[], warnings=warnings)
+        else:
+            update_status(run_dir, "failed", issues=blocker_result.issues, warnings=warnings)
+        return blocker_result
+
+    latest_review = latest_review_path(run_dir)
+    if config.mode == "lightweight" and latest_review is None:
+        if not issues:
+            update_status(run_dir, "passed", issues=[], warnings=warnings, mode=config.mode)
+            return ValidationResult(status="passed", ok=True, warnings=warnings)
+        update_status(run_dir, "failed", issues=issues, warnings=warnings, mode=config.mode)
+        return ValidationResult(status="failed", ok=False, issues=issues, warnings=warnings)
+
+    if latest_review is None:
+        issues.append("No review-0N.md file exists")
+        update_status(run_dir, "failed", issues=issues, warnings=warnings, mode=config.mode)
+        return ValidationResult(status="failed", ok=False, issues=issues, warnings=warnings)
+
+    review_text = latest_review.read_text()
+    if file_has_placeholders(latest_review):
+        issues.append(f"{latest_review.name} still contains placeholders or incomplete fields")
+
+    for required_section in (
+        "Phase 1 - Blind Intent",
+        "Reviewer independent intent:",
+        "Phase 2 - Intent Comparison",
+        "Corrected intent for implementation review:",
+        "Phase 3 - Implementation Review",
+    ):
+        if required_section not in review_text:
+            issues.append(f"{latest_review.name} is missing section: {required_section}")
+
+    scores = parse_scores(review_text)
+    threshold = validation_threshold(config)
+    for field in SCORE_FIELDS:
+        value = scores.get(field)
+        if value is None:
+            issues.append(f"{latest_review.name} is missing score: {field}")
+        elif value < threshold:
+            issues.append(f"{field} score {value} is below threshold {threshold}")
+
+    if re.search(r"Status:\s*Missed\b", review_text, re.IGNORECASE):
+        issues.append("At least one explicit request is marked Missed")
+    if re.search(r"Any rejected pattern reintroduced in equivalent form\?\s*Yes\b", review_text, re.IGNORECASE):
+        issues.append("Rejected pattern was reintroduced")
+    if re.search(r"Any core constraint violated\?\s*Yes\b", review_text, re.IGNORECASE):
+        issues.append("Core constraint was violated")
+    if re.search(r"Final verdict:\s*Fail\b", review_text, re.IGNORECASE):
+        issues.append("Final verdict is Fail")
+
+    evidence_text = (run_dir / "evidence.md").read_text() if (run_dir / "evidence.md").exists() else ""
+    evidence_lower = evidence_text.lower()
+    if config.mode == "strict":
+        for check in config.required_checks:
+            if check.lower() not in evidence_lower:
+                issues.append(f"Required check missing from evidence: {check}")
+    else:
+        for check in config.required_checks:
+            if check.lower() not in evidence_lower:
+                warnings.append(f"Required check not mentioned in evidence: {check}")
+
+    if config.visual_qa and not re.search(r"(screenshot|viewport|visual qa|desktop|mobile)", evidence_lower):
+        issues.append("Visual QA is required by config but not evidenced")
+    if config.deploy_verification and not re.search(r"(deploy|deployment|ready|verified|production)", evidence_lower):
+        issues.append("Deployment verification is required by config but not evidenced")
+
+    stale_paths: list[str] = []
+    if config.stale_review_detection:
+        review_mtime = latest_review.stat().st_mtime
+        for artifact_name in ("request.md", "intent.md", "change-manifest.md", "evidence.md"):
+            artifact = run_dir / artifact_name
+            if artifact.exists() and artifact.stat().st_mtime > review_mtime + 0.5:
+                stale_paths.append(str(artifact))
+        for path in referenced_paths(repo_root, run_dir):
+            if path.exists() and path.stat().st_mtime > review_mtime + 0.5:
+                stale_paths.append(str(path))
+        if stale_paths:
+            issues.append("Latest review is stale because files changed after review")
+            warnings.extend([f"Stale file: {path}" for path in stale_paths])
+
+    if issues:
+        status = "stale" if any("stale" in issue.lower() for issue in issues) else "failed"
+        update_status(
+            run_dir,
+            status,
+            issues=issues,
+            warnings=warnings,
+            scores=scores,
+            latestReview=str(latest_review),
+            mode=config.mode,
+        )
+        return ValidationResult(
+            status=status,
+            ok=False,
+            issues=issues,
+            warnings=warnings,
+            scores=scores,
+            latest_review=str(latest_review),
+        )
+
+    update_status(
+        run_dir,
+        "passed",
+        issues=[],
+        warnings=warnings,
+        scores=scores,
+        latestReview=str(latest_review),
+        latestReviewHash=file_hash(latest_review),
+        mode=config.mode,
+    )
+    return ValidationResult(
+        status="passed",
+        ok=True,
+        warnings=warnings,
+        scores=scores,
+        latest_review=str(latest_review),
+    )
+
+
+def agents_block(config: GateConfig) -> str:
+    return f"""## Intent Verification Gate
+
+Use $intent-verification-gate for meaningful UI, UX, product behavior, architecture, workflow, navigation, global-rule, or high-blast-radius changes.
+
+Before success, run:
+
+```bash
+python3 "$IVG" validate --run-dir <run-dir>
+```
+
+Use this repo's `{config.artifacts_root_rel}/{CONFIG_FILENAME}` for required checks and evidence.
+"""
+
+
+def install_gate(config: GateConfig, force: bool = False, write_agents: bool = False) -> dict[str, Any]:
+    config.artifacts_root.mkdir(parents=True, exist_ok=True)
+    installed: list[str] = []
+    skipped: list[str] = []
+
+    config_path = config.artifacts_root / CONFIG_FILENAME
+    if force or not config_path.exists():
+        payload = {
+            "artifactsRoot": config.artifacts_root_rel,
+            "mode": config.mode,
+            "profile": config.profile,
+            "requiredChecks": config.likely_checks,
+            "visualQa": config.visual_qa,
+            "deployVerification": config.deploy_verification,
+            "reviewMode": config.review_mode,
+            "staleReviewDetection": config.stale_review_detection,
+        }
+        write_json(config_path, payload)
+        installed.append(str(config_path))
+    else:
+        skipped.append(str(config_path))
+
+    readme_path = config.artifacts_root / "README.md"
+    if force or not readme_path.exists():
+        readme_path.write_text(read_template("README.md"))
+        installed.append(str(readme_path))
+    else:
+        skipped.append(str(readme_path))
+
+    block = agents_block(config)
+    agents_path = config.repo_root / "AGENTS.md"
+    if write_agents:
+        existing = agents_path.read_text() if agents_path.exists() else ""
+        if "## Intent Verification Gate" not in existing:
+            prefix = "\n\n" if existing.strip() else ""
+            agents_path.write_text(existing.rstrip() + prefix + block)
+            installed.append(str(agents_path))
+        else:
+            skipped.append(str(agents_path))
+
+    return {
+        "repo_root": str(config.repo_root),
+        "artifacts_root": str(config.artifacts_root),
+        "config_path": str(config_path),
+        "installed": installed,
+        "skipped": skipped,
+        "agents_block": block,
+    }
+
+
+def diagnose_repo(config: GateConfig) -> dict[str, Any]:
+    agents_path = config.repo_root / "AGENTS.md"
+    local_agents_has_routing = False
+    if agents_path.exists():
+        local_agents_has_routing = "intent-verification-gate" in agents_path.read_text()
+    return {
+        "repo_root": str(config.repo_root),
+        "artifacts_root": str(config.artifacts_root),
+        "config": config_payload(config),
+        "local_agents_path": str(agents_path),
+        "local_agents_exists": agents_path.exists(),
+        "local_agents_has_intent_verification_routing": local_agents_has_routing,
+    }
+
+
+def run_entries(config: GateConfig) -> list[dict[str, Any]]:
+    runs_root = config.artifacts_root / RUNS_DIRNAME
+    if not runs_root.exists():
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for run_dir in sorted(path for path in runs_root.glob("*/*") if path.is_dir()):
+        status = read_status(run_dir)
+        latest_review = latest_review_path(run_dir)
+        scores: dict[str, int] = {}
+        if latest_review:
+            scores = parse_scores(latest_review.read_text())
+        entries.append(
+            {
+                "runDir": str(run_dir),
+                "date": run_dir.parent.name,
+                "slug": run_dir.name,
+                "status": status.get("status", "unknown"),
+                "updatedAt": status.get("updatedAt"),
+                "mode": status.get("mode"),
+                "profile": status.get("profile"),
+                "latestReview": str(latest_review) if latest_review else None,
+                "scores": status.get("scores") or scores,
+                "issues": status.get("issues", []),
+            }
+        )
+    return entries
+
+
+def update_index(config: GateConfig) -> dict[str, Any]:
+    config.artifacts_root.mkdir(parents=True, exist_ok=True)
+    entries = run_entries(config)
+    index_payload = {
+        "schemaVersion": 1,
+        "updatedAt": iso_now(),
+        "repoRoot": str(config.repo_root),
+        "artifactsRoot": str(config.artifacts_root),
+        "runs": entries,
+    }
+    index_json = config.artifacts_root / INDEX_JSON_FILENAME
+    index_md = config.artifacts_root / INDEX_MD_FILENAME
+    write_json(index_json, index_payload)
+
+    lines = [
+        "# Intent Verification Run Index",
+        "",
+        f"Updated: {index_payload['updatedAt']}",
+        "",
+        "| Date | Status | Task | Latest review | Scores |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for entry in entries:
+        score_text = ", ".join(f"{key}: {value}" for key, value in entry.get("scores", {}).items())
+        latest = Path(entry["latestReview"]).name if entry.get("latestReview") else ""
+        lines.append(
+            f"| {entry['date']} | {entry['status']} | {entry['slug']} | {latest} | {score_text} |"
+        )
+    index_md.write_text("\n".join(lines) + "\n")
+    return {"index_json": str(index_json), "index_md": str(index_md), "run_count": len(entries)}
+
+
+def print_result(payload: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    for key, value in payload.items():
+        if isinstance(value, (dict, list)):
+            print(f"{key}: {json.dumps(value, indent=2, sort_keys=True)}")
+        else:
+            print(f"{key}: {value}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Manage durable intent-verification artifact folders."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    diagnose_parser = subparsers.add_parser("diagnose", help="Inspect repo gate configuration.")
+    diagnose_parser.add_argument("--repo", help="Repo root to inspect. Defaults to git root or cwd.")
+    diagnose_parser.add_argument("--artifacts-root", help="Relative artifact root under the repo.")
+    diagnose_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+
+    install_parser = subparsers.add_parser("install", help="Install artifact config and docs.")
+    install_parser.add_argument("--repo", help="Repo root to install into. Defaults to git root or cwd.")
+    install_parser.add_argument("--artifacts-root", help="Relative artifact root under the repo.")
+    install_parser.add_argument("--force", action="store_true", help="Overwrite existing config/README.")
+    install_parser.add_argument("--write-agents", action="store_true", help="Append local AGENTS.md routing block.")
+    install_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+
+    init_parser = subparsers.add_parser("init", help="Create a new run folder.")
+    init_parser.add_argument("--slug", required=True, help="Short task name for the run folder.")
+    init_parser.add_argument(
+        "--repo",
+        help="Repo root to use. Defaults to git root, or the current working directory.",
+    )
+    init_parser.add_argument(
+        "--artifacts-root",
+        help=f"Relative artifact root under the repo. Default: config value or {DEFAULT_ARTIFACTS_ROOT}",
+    )
+    init_parser.add_argument(
+        "--timestamp",
+        help="UTC timestamp override. Use YYYYMMDDTHHMMSSZ or YYYY-MM-DDTHH:MM:SSZ.",
+    )
+    init_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+
+    review_parser = subparsers.add_parser(
+        "next-review", help="Allocate the next numbered review file."
+    )
+    review_parser.add_argument("--run-dir", required=True, help="Absolute or relative run directory.")
+    review_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+
+    packet_parser = subparsers.add_parser(
+        "review-packet", help="Generate a clean phase-specific reviewer packet."
+    )
+    packet_parser.add_argument("--run-dir", required=True, help="Absolute or relative run directory.")
+    packet_parser.add_argument("--phase", required=True, choices=VALID_PHASES, help="Review phase.")
+    packet_parser.add_argument("--review-file", help="Review file to read phase context from.")
+    packet_parser.add_argument("--output", help="Optional file to write packet text to.")
+    packet_parser.add_argument("--json", action="store_true", help="Print JSON metadata.")
+
+    validate_parser = subparsers.add_parser("validate", help="Validate a run and update status.")
+    validate_parser.add_argument("--run-dir", required=True, help="Absolute or relative run directory.")
+    validate_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+
+    index_parser = subparsers.add_parser("index", help="Update the browsable run index.")
+    index_parser.add_argument("--repo", help="Repo root. Defaults to git root or cwd.")
+    index_parser.add_argument("--artifacts-root", help="Relative artifact root under the repo.")
+    index_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+
+    blocker_parser = subparsers.add_parser(
+        "blocker", help="Create blocker-report.md in the run directory."
+    )
+    blocker_parser.add_argument("--run-dir", required=True, help="Absolute or relative run directory.")
+    blocker_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "diagnose":
+        repo_root = detect_repo_root(args.repo)
+        config = load_gate_config(repo_root, args.artifacts_root)
+        print_result(diagnose_repo(config), args.json)
+        return 0
+
+    if args.command == "install":
+        repo_root = detect_repo_root(args.repo)
+        config = load_gate_config(repo_root, args.artifacts_root)
+        print_result(install_gate(config, force=args.force, write_agents=args.write_agents), args.json)
+        return 0
+
+    if args.command == "init":
+        repo_root = detect_repo_root(args.repo)
+        config = load_gate_config(repo_root, args.artifacts_root)
+        timestamp = parse_timestamp(args.timestamp)
+        paths = init_run(config, args.slug, timestamp)
+        print_result(
+            {
+                "artifacts_root": str(paths.artifacts_root),
+                "change_manifest_path": str(paths.manifest_path),
+                "evidence_path": str(paths.evidence_path),
+                "intent_path": str(paths.intent_path),
+                "repo_root": str(paths.repo_root),
+                "request_path": str(paths.request_path),
+                "run_dir": str(paths.run_dir),
+                "status_path": str(paths.status_path),
+                "trigger_decision_path": str(paths.trigger_decision_path),
+            },
+            args.json,
+        )
+        return 0
+
+    if args.command == "next-review":
+        review_path = create_next_review(Path(args.run_dir))
+        print_result({"review_path": str(review_path)}, args.json)
+        return 0
+
+    if args.command == "review-packet":
+        review_file = Path(args.review_file).resolve() if args.review_file else None
+        packet = build_review_packet(Path(args.run_dir), args.phase, review_file=review_file)
+        if args.output:
+            output_path = Path(args.output).resolve()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(packet)
+            print_result({"packet_path": str(output_path), "phase": args.phase}, args.json)
+            if not args.json:
+                print(packet)
+        elif args.json:
+            print_result({"phase": args.phase, "packet": packet}, True)
+        else:
+            print(packet)
+        return 0
+
+    if args.command == "validate":
+        result = validate_run(Path(args.run_dir))
+        payload = {
+            "ok": result.ok,
+            "status": result.status,
+            "issues": result.issues,
+            "warnings": result.warnings,
+            "scores": result.scores,
+            "latest_review": result.latest_review,
+        }
+        print_result(payload, args.json)
+        return 0 if result.ok else 1
+
+    if args.command == "index":
+        repo_root = detect_repo_root(args.repo)
+        config = load_gate_config(repo_root, args.artifacts_root)
+        print_result(update_index(config), args.json)
+        return 0
+
+    if args.command == "blocker":
+        blocker_path = create_blocker(Path(args.run_dir))
+        print_result({"blocker_path": str(blocker_path)}, args.json)
+        return 0
+
+    parser.error("Unknown command")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

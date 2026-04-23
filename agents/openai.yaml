@@ -1,0 +1,4 @@
+interface:
+  display_name: "Intent Verification Gate"
+  short_description: "Create durable intent and review artifacts"
+  default_prompt: "Use $intent-verification-gate to create durable intent-review artifacts and gate this meaningful change."

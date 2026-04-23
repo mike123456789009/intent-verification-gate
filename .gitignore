@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+docs/intent-verification/runs/
+docs/intent-verification/index.json
+docs/intent-verification/index.md
