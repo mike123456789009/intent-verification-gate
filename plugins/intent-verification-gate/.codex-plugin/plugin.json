@@ -1,0 +1,37 @@
+{
+  "name": "intent-verification-gate",
+  "version": "0.1.0",
+  "description": "Reusable intent verification workflow for durable request, intent, manifest, evidence, review, validation, blocker, index, and rerun artifacts.",
+  "author": {
+    "name": "Intent Verification Gate contributors"
+  },
+  "homepage": "https://github.com/mike123456789009/intent-verification-gate",
+  "repository": "https://github.com/mike123456789009/intent-verification-gate",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "skills",
+    "intent",
+    "verification",
+    "review",
+    "workflow"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Intent Verification Gate",
+    "shortDescription": "Durable intent, evidence, review, and rerun gate for Codex work.",
+    "longDescription": "Intent Verification Gate gives Codex a reusable artifact workflow for meaningful product, UX, architecture, workflow, and global-behavior changes. It includes helper commands for creating runs, validating evidence, generating review packets, recording blockers, indexing history, and rerunning past gate reviews without overwriting prior review rounds.",
+    "developerName": "Intent Verification Gate contributors",
+    "category": "Engineering",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use $intent-verification-gate before changing this workflow",
+      "Rerun the past intent verification gate for this change"
+    ],
+    "brandColor": "#315C7A",
+    "screenshots": []
+  }
+}

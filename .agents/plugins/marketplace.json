@@ -1,0 +1,20 @@
+{
+  "name": "intent-verification-gate",
+  "interface": {
+    "displayName": "Intent Verification Gate"
+  },
+  "plugins": [
+    {
+      "name": "intent-verification-gate",
+      "source": {
+        "source": "local",
+        "path": "./plugins/intent-verification-gate"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Engineering"
+    }
+  ]
+}
