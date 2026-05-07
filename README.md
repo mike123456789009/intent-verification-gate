@@ -4,8 +4,8 @@ A public Codex plugin marketplace for the `intent-verification-gate` skill.
 
 The skill helps agents make meaningful changes auditable by saving the raw user
 request, a best-estimate intent statement, a change manifest, verification
-evidence, phased review output, machine-readable gate status, and rerunnable
-review history.
+evidence, a submitted implementation plan, phased review output,
+machine-readable gate status, and rerunnable review history.
 
 This repository intentionally excludes local run history, project-specific
 artifacts, private workspace files, Python cache files, and machine-specific

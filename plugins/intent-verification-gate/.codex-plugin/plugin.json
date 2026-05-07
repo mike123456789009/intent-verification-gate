@@ -1,7 +1,7 @@
 {
   "name": "intent-verification-gate",
-  "version": "0.1.0",
-  "description": "Reusable intent verification workflow for durable request, intent, manifest, evidence, review, validation, blocker, index, and rerun artifacts.",
+  "version": "0.1.1",
+  "description": "Reusable intent verification workflow for durable request, intent, plan, manifest, evidence, review, validation, blocker, index, and rerun artifacts.",
   "author": {
     "name": "Intent Verification Gate contributors"
   },
@@ -19,8 +19,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Intent Verification Gate",
-    "shortDescription": "Durable intent, evidence, review, and rerun gate for Codex work.",
-    "longDescription": "Intent Verification Gate gives Codex a reusable artifact workflow for meaningful product, UX, architecture, workflow, and global-behavior changes. It includes helper commands for creating runs, validating evidence, generating review packets, recording blockers, indexing history, and rerunning past gate reviews without overwriting prior review rounds.",
+    "shortDescription": "Durable intent, plan, evidence, review, and rerun gate for Codex work.",
+    "longDescription": "Intent Verification Gate gives Codex a reusable artifact workflow for meaningful product, UX, architecture, workflow, and global-behavior changes. It includes helper commands for creating runs with submitted implementation plans, validating evidence and plan completion, generating review packets, recording blockers, indexing history, and rerunning past gate reviews without overwriting prior review rounds.",
     "developerName": "Intent Verification Gate contributors",
     "category": "Engineering",
     "capabilities": [

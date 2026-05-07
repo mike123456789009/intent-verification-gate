@@ -21,6 +21,7 @@ from typing import Any
 DEFAULT_ARTIFACTS_ROOT = "docs/intent-verification"
 CONFIG_FILENAME = "gate.config.json"
 STATUS_FILENAME = "gate-status.json"
+PLAN_FILENAME = "plan.md"
 TRIGGER_DECISION_FILENAME = "trigger-decision.md"
 INDEX_JSON_FILENAME = "index.json"
 INDEX_MD_FILENAME = "index.md"
@@ -119,6 +120,7 @@ class RunPaths:
     run_dir: Path
     request_path: Path
     intent_path: Path
+    plan_path: Path
     manifest_path: Path
     evidence_path: Path
     trigger_decision_path: Path
@@ -449,6 +451,7 @@ def init_run(config: GateConfig, slug: str, timestamp: datetime) -> RunPaths:
 
     request_path = run_dir / "request.md"
     intent_path = run_dir / "intent.md"
+    plan_path = run_dir / PLAN_FILENAME
     manifest_path = run_dir / "change-manifest.md"
     evidence_path = run_dir / "evidence.md"
     trigger_decision_path = run_dir / TRIGGER_DECISION_FILENAME
@@ -456,6 +459,7 @@ def init_run(config: GateConfig, slug: str, timestamp: datetime) -> RunPaths:
 
     ensure_file(request_path, "request.md")
     ensure_file(intent_path, "intent.md")
+    ensure_file(plan_path, PLAN_FILENAME)
     ensure_file(manifest_path, "change-manifest.md")
     ensure_file(evidence_path, "evidence.md")
     ensure_file(trigger_decision_path, "trigger-decision.md")
@@ -470,6 +474,7 @@ def init_run(config: GateConfig, slug: str, timestamp: datetime) -> RunPaths:
             "repoRoot": str(config.repo_root),
             "artifactsRoot": str(config.artifacts_root),
             "runDir": str(run_dir),
+            "planPath": str(plan_path),
             "mode": config.mode,
             "profile": config.profile,
             "reviewMode": config.review_mode,
@@ -487,6 +492,7 @@ def init_run(config: GateConfig, slug: str, timestamp: datetime) -> RunPaths:
         run_dir=run_dir,
         request_path=request_path,
         intent_path=intent_path,
+        plan_path=plan_path,
         manifest_path=manifest_path,
         evidence_path=evidence_path,
         trigger_decision_path=trigger_decision_path,
@@ -561,6 +567,7 @@ def build_review_packet(run_dir: Path, phase: str, review_file: Path | None = No
 
     request_path = run_dir / "request.md"
     intent_path = run_dir / "intent.md"
+    plan_path = run_dir / PLAN_FILENAME
     manifest_path = run_dir / "change-manifest.md"
     evidence_path = run_dir / "evidence.md"
     review_path = review_file or latest_review_path(run_dir)
@@ -619,6 +626,7 @@ def build_review_packet(run_dir: Path, phase: str, review_file: Path | None = No
             corrected_intent or "[missing corrected intent in review file]",
             "```",
             "",
+            file_block("Submitted Implementation Plan", plan_path),
             file_block("Change Manifest", manifest_path),
             file_block("Evidence", evidence_path),
         ]
@@ -642,9 +650,16 @@ PLACEHOLDER_PATTERNS = (
     re.compile(r"strict / standard / lightweight"),
     re.compile(r"low / medium / high"),
     re.compile(r"Met / Partially Met / Missed"),
+    re.compile(r"Planned / In Progress / Completed"),
     re.compile(r"Yes/No"),
     re.compile(r"Pass / Fail"),
 )
+
+PLAN_STATUS_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:\d+\.\s*)?(?:Status|Completion status):\s*(.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+PLAN_CHECKBOX_RE = re.compile(r"^\s*(?:[-*]|\d+\.)\s*\[([ xX])\]\s+\S", re.MULTILINE)
 
 
 def file_has_placeholders(path: Path) -> bool:
@@ -684,7 +699,7 @@ PATH_TOKEN_RE = re.compile(r"`([^`]+)`|(?:^|\s)((?:/[^:\s]+|[A-Za-z0-9_.-]+/[A-Z
 
 def referenced_paths(repo_root: Path, run_dir: Path) -> list[Path]:
     paths: list[Path] = []
-    for artifact_name in ("change-manifest.md", "evidence.md"):
+    for artifact_name in (PLAN_FILENAME, "change-manifest.md", "evidence.md"):
         artifact = run_dir / artifact_name
         if not artifact.exists():
             continue
@@ -732,6 +747,47 @@ def validate_blocker(run_dir: Path) -> ValidationResult:
     return ValidationResult(status="blocked", ok=not issues, issues=issues)
 
 
+def validate_plan(run_dir: Path) -> list[str]:
+    plan_path = run_dir / PLAN_FILENAME
+    issues: list[str] = []
+    if not plan_path.exists():
+        return [f"{PLAN_FILENAME} is missing"]
+    if file_has_placeholders(plan_path):
+        issues.append(f"{PLAN_FILENAME} still contains placeholders or incomplete fields")
+
+    text = plan_path.read_text()
+    if "IMPLEMENTATION PLAN" not in text:
+        issues.append(f"{PLAN_FILENAME} is missing heading: IMPLEMENTATION PLAN")
+    if "Intent source:" not in text:
+        issues.append(f"{PLAN_FILENAME} is missing heading: Intent source:")
+    if "Plan items:" not in text:
+        issues.append(f"{PLAN_FILENAME} is missing heading: Plan items:")
+    if "Coverage check:" not in text:
+        issues.append(f"{PLAN_FILENAME} is missing heading: Coverage check:")
+
+    statuses = [match.group(1).strip() for match in PLAN_STATUS_RE.finditer(text)]
+    if statuses:
+        incomplete = [
+            status
+            for status in statuses
+            if not re.match(r"^(complete|completed|done)\b", status, re.IGNORECASE)
+        ]
+        if incomplete:
+            issues.append(
+                f"{PLAN_FILENAME} has incomplete plan item statuses: {', '.join(incomplete)}"
+            )
+        return issues
+
+    checkboxes = [match.group(1) for match in PLAN_CHECKBOX_RE.finditer(text)]
+    if checkboxes:
+        if any(marker != "x" and marker != "X" for marker in checkboxes):
+            issues.append(f"{PLAN_FILENAME} has unchecked plan items")
+        return issues
+
+    issues.append(f"{PLAN_FILENAME} must include at least one plan item with a completion status")
+    return issues
+
+
 def validation_threshold(config: GateConfig) -> int:
     return 75 if config.mode == "lightweight" else 90
 
@@ -760,6 +816,8 @@ def validate_run(run_dir: Path, config: GateConfig | None = None) -> ValidationR
             continue
         if file_has_placeholders(path):
             issues.append(f"{filename} still contains placeholders or incomplete fields")
+
+    issues.extend(validate_plan(run_dir))
 
     blocker_path = run_dir / "blocker-report.md"
     if blocker_path.exists():
@@ -834,7 +892,13 @@ def validate_run(run_dir: Path, config: GateConfig | None = None) -> ValidationR
     stale_paths: list[str] = []
     if config.stale_review_detection:
         review_mtime = latest_review.stat().st_mtime
-        for artifact_name in ("request.md", "intent.md", "change-manifest.md", "evidence.md"):
+        for artifact_name in (
+            "request.md",
+            "intent.md",
+            PLAN_FILENAME,
+            "change-manifest.md",
+            "evidence.md",
+        ):
             artifact = run_dir / artifact_name
             if artifact.exists() and artifact.stat().st_mtime > review_mtime + 0.5:
                 stale_paths.append(str(artifact))
@@ -1243,6 +1307,7 @@ def main() -> int:
                 "change_manifest_path": str(paths.manifest_path),
                 "evidence_path": str(paths.evidence_path),
                 "intent_path": str(paths.intent_path),
+                "plan_path": str(paths.plan_path),
                 "repo_root": str(paths.repo_root),
                 "request_path": str(paths.request_path),
                 "run_dir": str(paths.run_dir),

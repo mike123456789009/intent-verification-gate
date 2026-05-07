@@ -23,7 +23,7 @@ Modes:
 
 - `strict`: full phased review, score threshold 90, required checks enforced.
 - `standard`: full phased review, score threshold 90, repo checks recommended by config.
-- `lightweight`: durable request, intent, manifest, and evidence required; review may be optional for early trials or low-risk work.
+- `lightweight`: durable request, intent, submitted plan, manifest, and evidence required; review may be optional for early trials or low-risk work.
 
 Profiles provide defaults only. Repo config overrides them.
 
@@ -79,6 +79,36 @@ Risk of misinterpretation:
 - Phrase: "..."
   Chosen interpretation: ...
 ```
+
+## Implementation Plan
+
+Save this in `plan.md` after `intent.md` is filled and before substantive
+implementation starts:
+
+```text
+IMPLEMENTATION PLAN
+
+Intent source:
+Summarize how this plan fulfills `intent.md`.
+
+Plan items:
+1. Change:
+   Status: Planned / In Progress / Completed
+   Completion evidence:
+2. Change:
+   Status: Planned / In Progress / Completed
+   Completion evidence:
+
+Coverage check:
+- Explicit requests covered:
+- Non-goals preserved:
+- Known dependencies or sequencing:
+```
+
+The submitted plan is a durable artifact, not private chain-of-thought. Each
+plan item must have a completion status. Before the gate can pass, every plan
+item must be marked `Completed` or `Done`, or every checklist item in the plan
+must be checked.
 
 ## Change Manifest
 
@@ -205,16 +235,18 @@ The reviewer must compare the two and identify omitted requests, invented constr
 Give the reviewer only:
 
 1. the corrected intent from phase 2
-2. the Change Manifest
-3. the Evidence
+2. the submitted Implementation Plan
+3. the Change Manifest
+4. the Evidence
 
-The reviewer grades implementation against corrected intent.
+The reviewer grades implementation against corrected intent and should treat the
+submitted plan as a completion checklist, not as private reasoning.
 
 Do not give the reviewer:
 
 - the main agent's justification
 - persuasive framing
-- the main agent's private plan
+- any private plan outside the submitted `plan.md` artifact
 - leniency instructions
 - target scores
 
@@ -373,6 +405,8 @@ Strict and standard modes do not pass unless all of these are true:
 - no explicit request is marked `Missed`
 - no core constraint is violated
 - no rejected pattern is reintroduced in equivalent form
+- `plan.md` exists
+- every submitted `plan.md` item is marked `Completed` or `Done`, or every checklist item is checked
 - blind-intent review exists
 - intent-comparison review exists
 - implementation review exists
@@ -387,6 +421,7 @@ A review is stale if any of these changed after the latest review file was writt
 
 - `request.md`
 - `intent.md`
+- `plan.md`
 - `change-manifest.md`
 - `evidence.md`
 - files referenced by the manifest or evidence that exist on disk

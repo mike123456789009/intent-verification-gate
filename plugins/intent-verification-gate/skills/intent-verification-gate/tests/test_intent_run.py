@@ -92,6 +92,30 @@ def write_filled_artifacts(run_dir: Path, repo: Path) -> Path:
             ]
         )
     )
+    (run_dir / "plan.md").write_text(
+        "\n".join(
+            [
+                "IMPLEMENTATION PLAN",
+                "",
+                "Intent source:",
+                "This plan fulfills intent.md by building and verifying the sample behavior.",
+                "",
+                "Plan items:",
+                "1. Change: Create src/app.py with sample behavior.",
+                "   Status: Completed",
+                "   Completion evidence: src/app.py contains the sample behavior.",
+                "2. Change: Record verification evidence.",
+                "   Status: Completed",
+                "   Completion evidence: evidence.md records the test command result.",
+                "",
+                "Coverage check:",
+                "- Explicit requests covered: build and verify the sample behavior.",
+                "- Non-goals preserved: no unrelated features were added.",
+                "- Known dependencies or sequencing: implementation happened before review.",
+                "",
+            ]
+        )
+    )
     (run_dir / "change-manifest.md").write_text(
         "\n".join(
             [
@@ -288,10 +312,12 @@ class IntentRunTests(unittest.TestCase):
             run_dir = Path(payload["run_dir"])
             self.assertTrue((run_dir / "request.md").exists())
             self.assertTrue((run_dir / "intent.md").exists())
+            self.assertTrue((run_dir / "plan.md").exists())
             self.assertTrue((run_dir / "change-manifest.md").exists())
             self.assertTrue((run_dir / "evidence.md").exists())
             self.assertTrue((run_dir / "trigger-decision.md").exists())
             self.assertTrue((run_dir / "gate-status.json").exists())
+            self.assertEqual(Path(payload["plan_path"]).name, "plan.md")
 
             first = run_json("next-review", "--run-dir", str(run_dir))
             second = run_json("next-review", "--run-dir", str(run_dir))
@@ -405,6 +431,63 @@ class IntentRunTests(unittest.TestCase):
             self.assertIn(disclosure, comparison.stdout)
             self.assertIn(disclosure, implementation.stdout)
 
+    def test_review_packet_includes_submitted_plan_for_implementation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            payload = run_json("init", "--repo", str(repo), "--slug", "plan packet")
+            run_dir = Path(payload["run_dir"])
+            (run_dir / "plan.md").write_text(
+                "\n".join(
+                    [
+                        "IMPLEMENTATION PLAN",
+                        "",
+                        "Intent source:",
+                        "Plan packet fixture.",
+                        "",
+                        "Plan items:",
+                        "1. Change: Show submitted plan in packet.",
+                        "   Status: Completed",
+                        "   Completion evidence: Packet contains this plan.",
+                        "",
+                        "Coverage check:",
+                        "- Explicit requests covered: plan is visible to implementation review.",
+                        "- Non-goals preserved: private plans stay private.",
+                        "- Known dependencies or sequencing: review follows plan submission.",
+                        "",
+                    ]
+                )
+            )
+            review = Path(run_json("next-review", "--run-dir", str(run_dir))["review_path"])
+            review.write_text(
+                "\n".join(
+                    [
+                        "REVIEW",
+                        "",
+                        "Phase 1 - Blind Intent",
+                        "Reviewer independent intent:",
+                        "Inspect implementation packet.",
+                        "",
+                        "Phase 2 - Intent Comparison",
+                        "Corrected intent for implementation review:",
+                        "Inspect the submitted plan during implementation review.",
+                        "",
+                        "Phase 3 - Implementation Review",
+                        "",
+                    ]
+                )
+            )
+
+            implementation = run_cli(
+                "review-packet",
+                "--run-dir",
+                str(run_dir),
+                "--phase",
+                "implementation",
+            )
+
+            self.assertIn("Submitted Implementation Plan", implementation.stdout)
+            self.assertIn("Show submitted plan in packet", implementation.stdout)
+
     def test_validate_fails_on_template_placeholders(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -414,6 +497,42 @@ class IntentRunTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["status"], "failed")
             self.assertTrue(any("request.md" in issue for issue in result["issues"]))
+
+    def test_validate_fails_when_plan_items_are_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            payload = run_json("init", "--repo", str(repo), "--slug", "incomplete plan")
+            run_dir = Path(payload["run_dir"])
+            write_filled_artifacts(run_dir, repo)
+            (run_dir / "plan.md").write_text(
+                "\n".join(
+                    [
+                        "IMPLEMENTATION PLAN",
+                        "",
+                        "Intent source:",
+                        "This plan maps to intent.md but is not complete yet.",
+                        "",
+                        "Plan items:",
+                        "1. Change: Finish the sample behavior.",
+                        "   Status: In Progress",
+                        "   Completion evidence: Not complete yet.",
+                        "",
+                        "Coverage check:",
+                        "- Explicit requests covered: build and verify the sample behavior.",
+                        "- Non-goals preserved: no unrelated features.",
+                        "- Known dependencies or sequencing: implementation must finish before review.",
+                        "",
+                    ]
+                )
+            )
+            review = Path(run_json("next-review", "--run-dir", str(run_dir))["review_path"])
+            write_passing_review(review)
+
+            result = run_json("validate", "--run-dir", str(run_dir), check=False)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "failed")
+            self.assertTrue(any("incomplete plan item statuses" in issue for issue in result["issues"]))
 
     def test_validate_passes_filled_strict_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
